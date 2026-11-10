@@ -11,13 +11,16 @@ Recovered/maintained fork of the former `thewh1teagle/checksum` action.
 Include in your workflow file:
 
 ```yml
-uses: XDcobra/checksum@v1
+# Prefer a full commit SHA when the job token can write releases.
+uses: XDcobra/checksum@<commit-sha> # v1.0.1
 with:
   patterns: | # Optional
     *.zip
     *.tar.gz
   algorithm: sha256 # Optional. See bun.sh/docs/api/hashing#bun-cryptohasher for supported algorithms
 ```
+
+Floating tags such as `@v1` may move after review. For workflows that upload release assets, pin a reviewed commit SHA (and keep transitive pins inside this action).
 
 You must enable write permission in github.com/user/repo/settings/actions -> Workflow permissions -> Read and write permissions.
 
@@ -32,7 +35,7 @@ You must enable write permission in github.com/user/repo/settings/actions -> Wor
 | `tag`          | The tag of the release to generate checksums for.                                                                               | No           | `''`             |
 | `file-name`    | The name of the checksum file to generate.                                                                                      | No           | `checksum.txt`   |
 | `dry-run`      | Create checksum without upload. Will be available in the console output of the action.                                          | No           | `false`          |
-| `bun-version`  | The version of Bun to use.                                                                                                      | No           | `latest`         |
+| `bun-version`  | The version of Bun to use (pinned concrete version recommended).                                                                | No           | `1.4.4`          |
 
 ## Example checksum.txt
 
@@ -61,7 +64,7 @@ jobs:
 
     steps:
       - name: Run checksum action
-        uses: XDcobra/checksum@v1
+        uses: XDcobra/checksum@<commit-sha> # v1.0.1
         with:
           patterns: | # Optional
             *.zip

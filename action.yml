@@ -7,9 +7,9 @@ description: "A reusable action to create checksum.txt by streaming release asse
 
 inputs:
   bun-version:
-    description: "The version of Bun to use"
+    description: "The version of Bun to use (pin a concrete version; avoid latest)"
     required: false
-    default: "latest"
+    default: "1.4.4"
   repo:
     description: "The GitHub repository (owner/repo)"
     required: false
@@ -41,7 +41,8 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - uses: oven-sh/setup-bun@v2
+    # Pin transitive action by commit SHA (floating @v2 can move).
+    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       with:
         bun-version: ${{ inputs.bun-version }}
 
