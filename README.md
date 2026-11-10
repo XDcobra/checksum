@@ -2,12 +2,16 @@
 
 This action calculates the checksum (e.g., SHA-256) for all assets in your GitHub releases and generates a `checksum.txt` file. This is useful for ensuring file integrity during downloads and uploads.
 
+Assets are **streamed** from the GitHub Releases API into an incremental hasher. Peak memory stays near the stream chunk size; release assets are **not** written to disk (only `checksum.txt` is).
+
+Recovered/maintained fork of the former `thewh1teagle/checksum` action.
+
 ## Usage
 
 Include in your workflow file:
 
 ```yml
-uses: thewh1teagle/checksum@v1
+uses: XDcobra/checksum@v1
 with:
   patterns: | # Optional
     *.zip
@@ -27,7 +31,7 @@ You must enable write permission in github.com/user/repo/settings/actions -> Wor
 | `pre-release`  | Whether to run on pre-releases.                                                                                                 | No           | `false`          |
 | `tag`          | The tag of the release to generate checksums for.                                                                               | No           | `''`             |
 | `file-name`    | The name of the checksum file to generate.                                                                                      | No           | `checksum.txt`   |
-| `dry-run`      | Run without upload. will be available in the console output of the action.                                                      | No           | `checksum.txt`   |
+| `dry-run`      | Create checksum without upload. Will be available in the console output of the action.                                          | No           | `false`          |
 | `bun-version`  | The version of Bun to use.                                                                                                      | No           | `latest`         |
 
 ## Example checksum.txt
@@ -57,7 +61,7 @@ jobs:
 
     steps:
       - name: Run checksum action
-        uses: thewh1teagle/checksum@v1
+        uses: XDcobra/checksum@v1
         with:
           patterns: | # Optional
             *.zip

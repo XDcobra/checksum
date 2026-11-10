@@ -1,9 +1,9 @@
 name: "Checksums Action"
-author: thewh1teagle
+author: XDcobra
 branding:
-  icon: 'check-circle'  # Optional, you can add a custom icon
+  icon: 'check-circle'
   color: 'blue'
-description: "A reusable action to create checksum.txt"
+description: "A reusable action to create checksum.txt by streaming release assets (no on-disk download)"
 
 inputs:
   bun-version:
