@@ -1,20 +1,16 @@
 import { $, Glob, type SupportedCryptoAlgorithms } from "bun";
-import { appendFile, readFile, stat } from "fs/promises";
-
-interface Asset {
-  apiUrl?: string;
-  browser_download_url?: string;
-  contentType?: string;
-  createdAt?: string;
-  downloadCount?: number;
-  id?: string;
-  label?: string;
-  name: string;
-  size: number;
-  state?: string;
-  updatedAt?: string;
-  url?: string;
-}
+import { readFile, stat, writeFile } from "fs/promises";
+import {
+  type Asset,
+  HttpError,
+  findStale,
+  mergeChecksums,
+  normalizeAsset,
+  parseChecksumFile,
+  processAsset,
+  serializeChecksums,
+  withRetry,
+} from "./lib";
 
 const PROGRESS_BYTES = 64 * 1024 * 1024; // 64 MiB
 const PROGRESS_MS = 5000;
@@ -70,11 +66,8 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
 }
 
-/**
- * Stream an asset from GitHub into Bun.CryptoHasher.
- * Peak RAM ≈ chunk size; the asset is never written to disk.
- */
-async function hashAssetFromRelease(asset: Asset): Promise<string> {
+/** Start downloading an asset; throws HttpError on a non-2xx status. */
+async function fetchAsset(asset: Asset): Promise<Response> {
   const { url, useApiHeaders } = resolveAssetFetch(asset);
   const token = githubToken();
   const headers: Record<string, string> = {};
@@ -86,18 +79,28 @@ async function hashAssetFromRelease(asset: Asset): Promise<string> {
     }
   }
 
-  console.log(`Streaming hash for ${asset.name} (${formatBytes(asset.size)})...`);
-
   const res = await fetch(url, {
     headers,
     redirect: "follow",
   });
 
   if (!res.ok) {
-    throw new Error(
+    throw new HttpError(
+      res.status,
       `Failed to download ${asset.name}: ${res.status} ${res.statusText}`
     );
   }
+  return res;
+}
+
+/**
+ * Stream an asset from GitHub into Bun.CryptoHasher.
+ * Peak RAM ≈ chunk size; the asset is never written to disk.
+ */
+async function hashAssetFromRelease(asset: Asset): Promise<string> {
+  console.log(`Streaming hash for ${asset.name} (${formatBytes(asset.size)})...`);
+
+  const res = await fetchAsset(asset);
   if (!res.body) {
     throw new Error(`No response body for ${asset.name}`);
   }
@@ -220,39 +223,196 @@ if (tagInput) {
 
 const patterns = parsePatternsInput(process.env.INPUT_PATTERNS ?? "");
 
-let releaseContent: string;
-const token = githubToken();
-if (isDryRun && !token) {
-  releaseContent = await getReleaseNoAuth(repo, tag);
-} else {
-  releaseContent = await $`gh release view ${tag} -R ${repo} --json assets`.text();
-}
-const releases: { assets: Asset[] } = JSON.parse(releaseContent);
+const failOnError = process.env.INPUT_FAIL_ON_ERROR !== "false";
+const expectedHashLength = new Bun.CryptoHasher(
+  hashAlgorithm as SupportedCryptoAlgorithms
+).digest("hex").length;
 
-for (const asset of releases.assets) {
-  if (asset.name == checkSumPath) {
-    console.info("Found existing checksum in assets");
-    continue;
+async function listAssets(): Promise<Asset[]> {
+  let releaseContent: string;
+  if (isDryRun && !githubToken()) {
+    releaseContent = await getReleaseNoAuth(repo, tag);
+  } else {
+    releaseContent = await $`gh release view ${tag} -R ${repo} --json assets`.text();
   }
+  const release: { assets: unknown[] } = JSON.parse(releaseContent);
+  return release.assets.map(normalizeAsset);
+}
+
+const retryOptions = {
+  attempts: 3,
+  baseDelayMs: 2000,
+  onRetry: (err: unknown, attempt: number, delayMs: number) =>
+    console.warn(
+      `Attempt ${attempt} failed (${err instanceof Error ? err.message : err}); retrying in ${delayMs} ms`
+    ),
+};
+
+const inScope = (list: Asset[]) =>
+  list.filter(
+    (a) =>
+      a.name !== checkSumPath &&
+      (!patterns.length || shouldIncludeAsset(a.name, patterns))
+  );
+
+let assets = await withRetry(listAssets, retryOptions);
+
+// Existing checksum file of the release: entries of assets we cannot re-hash are kept from it.
+const checksumAsset = assets.find((a) => a.name === checkSumPath);
+let existing = new Map<string, string>();
+if (checksumAsset) {
+  console.info("Found existing checksum in assets");
+  try {
+    const text = await withRetry(
+      async () => await (await fetchAsset(checksumAsset)).text(),
+      retryOptions
+    );
+    existing = parseChecksumFile(text);
+    console.log(`Loaded ${existing.size} existing checksum entries`);
+  } catch (err) {
+    console.warn(
+      `Could not read existing ${checkSumPath} (${err instanceof Error ? err.message : err}); it will be rebuilt from scratch`
+    );
+  }
+}
+
+const fresh = new Map<string, string>(); // name -> hash computed in this run
+const hashedVersion = new Map<string, Asset>(); // name -> asset version that was hashed
+const rehashed = new Set<string>();
+const skippedGone = new Set<string>();
+const failed = new Map<string, string>(); // name -> error message
+
+async function writeMerged(): Promise<void> {
+  const lines = mergeChecksums({
+    assets: inScope(assets),
+    existing,
+    fresh,
+    existingUpdatedAt: checksumAsset?.updatedAt,
+    expectedHashLength,
+  });
+  await writeFile(checkSumPath, serializeChecksums(lines));
+}
+
+async function processOne(asset: Asset): Promise<void> {
+  const outcome = await processAsset(asset, {
+    hash: hashAssetFromRelease,
+    listAssets: async () => {
+      assets = await listAssets();
+      return assets;
+    },
+    retry: retryOptions,
+    log: (msg) => console.warn(msg),
+  });
+  if (outcome.kind === "hashed") {
+    fresh.set(asset.name, outcome.hash);
+    hashedVersion.set(asset.name, outcome.asset);
+    failed.delete(asset.name);
+    skippedGone.delete(asset.name);
+    if (outcome.replaced) rehashed.add(asset.name);
+  } else if (outcome.kind === "gone") {
+    console.warn(`::warning::${asset.name} no longer exists in the release, skipped`);
+    fresh.delete(asset.name);
+    hashedVersion.delete(asset.name);
+    skippedGone.add(asset.name);
+  } else {
+    const msg =
+      outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+    console.error(`Failed to hash ${asset.name}: ${msg}`);
+    failed.set(asset.name, msg);
+  }
+}
+
+async function uploadMerged(final: boolean): Promise<void> {
+  await writeMerged();
+  try {
+    await uploadChecksumFile(checkSumPath, repo, tag);
+  } catch (err) {
+    if (final) throw err;
+    console.warn(
+      `Intermediate upload failed (${err instanceof Error ? err.message : err}); continuing`
+    );
+  }
+}
+
+const notUploaded = new Set<string>();
+for (const asset of assets) {
+  if (asset.name == checkSumPath) continue;
   if (patterns.length && !shouldIncludeAsset(asset.name, patterns)) {
     console.log(`Skip ${asset.name}`);
     continue;
   }
+  if (asset.state !== undefined && asset.state !== "uploaded") {
+    console.warn(`Skip ${asset.name}: state is "${asset.state}", not "uploaded"`);
+    notUploaded.add(asset.name);
+    continue;
+  }
 
-  const checksum = await hashAssetFromRelease(asset);
-  await appendFile(checkSumPath, `${asset.name}\t${checksum}\n`);
+  await processOne(asset);
 
-  if (asset.size > minSizeImmediateUpload) {
+  if (fresh.has(asset.name) && asset.size > minSizeImmediateUpload) {
     console.log(`Uploading immediately due to large file: ${asset.name}`);
-    await uploadChecksumFile(checkSumPath, repo, tag);
+    await uploadMerged(false);
   }
 }
 
-await uploadChecksumFile(checkSumPath, repo, tag);
+// Assets may have been replaced or added while we were hashing: re-list and catch up.
+for (let round = 0; round < 3; round++) {
+  try {
+    assets = await withRetry(listAssets, retryOptions);
+  } catch (err) {
+    console.warn(`Could not re-list the release: ${err instanceof Error ? err.message : err}`);
+    break;
+  }
+  const todo = inScope(assets).filter(
+    (a) =>
+      (a.state === undefined || a.state === "uploaded") &&
+      !failed.has(a.name) &&
+      (!hashedVersion.has(a.name) || findStale(hashedVersion, [a]).length > 0)
+  );
+  if (todo.length === 0) break;
+  for (const asset of todo) {
+    console.log(`Catching up on ${asset.name} (new or changed during the run)`);
+    const wasHashed = hashedVersion.has(asset.name);
+    await processOne(asset);
+    if (wasHashed && fresh.has(asset.name)) rehashed.add(asset.name);
+  }
+}
+
+// Anything still not matching the final listing must not be written with a stale hash.
+for (const asset of findStale(hashedVersion, assets)) {
+  console.error(`${asset.name} changed after it was hashed; dropping its entry`);
+  fresh.delete(asset.name);
+  failed.set(asset.name, "changed after it was hashed");
+}
+
+await uploadMerged(true);
+
+const finalScope = inScope(assets);
+const stillNotUploaded = finalScope.filter(
+  (a) => a.state !== undefined && a.state !== "uploaded"
+).length;
+const summary = {
+  processed: fresh.size,
+  rehashedAfterReplacement: rehashed.size,
+  skippedGone: skippedGone.size,
+  skippedNotUploaded: stillNotUploaded,
+  failed: failed.size,
+};
 
 console.log(
   `Release Tag: ${tag}, Repo: ${repo}, Algorithm: ${hashAlgorithm}, Patterns: ${JSON.stringify(
     patterns
-  )}, Assets processed: ${releases.assets.length}`
+  )}`
+);
+console.log(
+  `Summary: processed=${summary.processed}, re-hashed after replacement=${summary.rehashedAfterReplacement}, skipped (gone)=${summary.skippedGone}, skipped (not uploaded)=${summary.skippedNotUploaded}, failed=${summary.failed}`
 );
 console.log(`Checksum file content:\n${await readFile(checkSumPath, "utf-8")}`);
+
+if (failed.size > 0) {
+  const level = failOnError ? "error" : "warning";
+  for (const [name, msg] of failed) {
+    console.log(`::${level}::Could not checksum ${name}: ${msg}`);
+  }
+  if (failOnError) process.exit(1);
+}
