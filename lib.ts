@@ -99,9 +99,15 @@ export function buildChecksumLines(finalAssets: Asset[], hashed: Map<string, Has
 /**
  * Upload only when it is safe: with fail-on-error any failed asset blocks the upload (the existing
  * checksum file stays untouched); otherwise the file is uploaded without the failed assets.
- * Assets that vanished or are not `uploaded` are not failures.
+ * Assets that vanished or are not `uploaded` are not failures. Without a final listing nothing can be
+ * verified, so nothing is uploaded in either mode.
  */
-export function shouldUpload(failedCount: number, failOnError: boolean): boolean {
+export function shouldUpload(
+  failedCount: number,
+  failOnError: boolean,
+  finalListingOk: boolean
+): boolean {
+  if (!finalListingOk) return false;
   return !(failOnError && failedCount > 0);
 }
 

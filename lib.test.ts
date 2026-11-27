@@ -72,18 +72,22 @@ describe("buildChecksumLines", () => {
 });
 
 describe("shouldUpload", () => {
-  test("fail-on-error and a failure: no upload", () => expect(shouldUpload(1, true)).toBe(false));
-  test("all ok: upload", () => expect(shouldUpload(0, true)).toBe(true));
+  test("fail-on-error and a failure: no upload", () => expect(shouldUpload(1, true, true)).toBe(false));
+  test("all ok: upload", () => expect(shouldUpload(0, true, true)).toBe(true));
   test("vanished asset is no failure: upload without it", () => {
     const final = [A("a")]; // "gone" was hashed earlier or skipped, not in the final listing
     const lines = buildChecksumLines(final, new Map([["a", { asset: A("a"), hash: "ha" }]]));
-    expect(shouldUpload(0, true)).toBe(true);
+    expect(shouldUpload(0, true, true)).toBe(true);
     expect(lines).toEqual(["a\tha"]);
   });
   test("fail-on-error false and a failure: upload without the failed asset", () => {
     const lines = buildChecksumLines([A("a"), A("bad")], new Map([["a", { asset: A("a"), hash: "ha" }]]));
-    expect(shouldUpload(1, false)).toBe(true);
+    expect(shouldUpload(1, false, true)).toBe(true);
     expect(lines).toEqual(["a\tha"]);
+  });
+  test("no final listing: no upload in either mode", () => {
+    expect(shouldUpload(0, true, false)).toBe(false);
+    expect(shouldUpload(0, false, false)).toBe(false);
   });
 });
 

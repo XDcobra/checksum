@@ -49,7 +49,7 @@ Release assets may be deleted or re-uploaded while the action runs. Errors are h
 
 The checksum file is uploaded exactly once, at the very end of the run:
 
-- right before the upload the release is listed again;
+- right before the upload the release is listed again; if that listing fails, nothing is uploaded in either mode (with `fail-on-error: true` the action exits with 1);
 - the file contains only hashes computed in this run, and only for assets that are `uploaded` in that final listing with the same version (id and `updated_at`) that was hashed;
 - nothing is carried over from the existing checksum file, which is not even read. An asset that failed, vanished, is not `uploaded` or changed after it was hashed gets no entry;
 - if the run stops before the end (cancelled, crashed, timed out), the checksum file already on the release stays untouched.

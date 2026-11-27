@@ -332,12 +332,14 @@ for (let round = 0; round < 3; round++) {
 
 // Final listing right before the single upload: only hashes of the version that is listed now are written.
 let finalAssets = assets;
+let finalListingOk = true;
 try {
   finalAssets = await withRetry(listAssets, retryOptions);
   assets = finalAssets;
 } catch (err) {
-  console.warn(
-    `Could not list the release before the upload (${err instanceof Error ? err.message : err}); using the last listing`
+  finalListingOk = false;
+  console.error(
+    `Could not list the release before the upload (${err instanceof Error ? err.message : err}); the hashes cannot be checked against the current assets`
   );
 }
 for (const asset of findStale(hashedVersion, finalAssets)) {
@@ -347,9 +349,13 @@ for (const asset of findStale(hashedVersion, finalAssets)) {
 }
 const lines = buildChecksumLines(inScope(finalAssets), hashedResults);
 await writeFile(checkSumPath, serializeChecksums(lines));
-const uploadAllowed = shouldUpload(failed.size, failOnError);
+const uploadAllowed = shouldUpload(failed.size, failOnError, finalListingOk);
 if (uploadAllowed) {
   await uploadChecksumFile(checkSumPath, repo, tag);
+} else if (!finalListingOk) {
+  console.error(
+    `Not uploading without a final listing: the existing ${checkSumPath} on the release stays untouched`
+  );
 } else {
   console.error(
     `${failed.size} asset(s) could not be hashed and fail-on-error is set: not uploading, the existing ${checkSumPath} on the release stays untouched`
@@ -378,10 +384,11 @@ console.log(
 );
 console.log(`Checksum file content:\n${await readFile(checkSumPath, "utf-8")}`);
 
-if (failed.size > 0) {
-  const level = failOnError ? "error" : "warning";
-  for (const [name, msg] of failed) {
-    console.log(`::${level}::Could not checksum ${name}: ${msg}`);
-  }
-  if (failOnError) process.exit(1);
+const level = failOnError ? "error" : "warning";
+if (!finalListingOk) {
+  console.log(`::${level}::Could not list the release before the upload; ${checkSumPath} was not uploaded`);
 }
+for (const [name, msg] of failed) {
+  console.log(`::${level}::Could not checksum ${name}: ${msg}`);
+}
+if (failOnError && (failed.size > 0 || !finalListingOk)) process.exit(1);
