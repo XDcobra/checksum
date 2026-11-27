@@ -35,7 +35,7 @@ You must enable write permission in github.com/user/repo/settings/actions -> Wor
 | `tag`          | The tag of the release to generate checksums for.                                                                               | No           | `''`             |
 | `file-name`    | The name of the checksum file to generate.                                                                                      | No           | `checksum.txt`   |
 | `dry-run`      | Create checksum without upload. Will be available in the console output of the action.                                          | No           | `false`          |
-| `fail-on-error` | Exit non-zero when an asset could not be hashed after retries. The merged checksum file is uploaded first. With `false` only `::warning::` lines are emitted. | No | `true` |
+| `fail-on-error` | Exit non-zero when an asset could not be hashed after retries. With `true` a failure prevents the upload (the existing checksum file stays untouched). With `false` the file is uploaded without the failed assets and only `::warning::` lines are emitted. | No | `true` |
 | `bun-version`  | The version of Bun to use (pinned concrete version recommended).                                                                | No           | `1.4.4`          |
 
 ## Behaviour with changing release assets
@@ -47,14 +47,14 @@ Release assets may be deleted or re-uploaded while the action runs. Errors are h
 - Network errors and `5xx`/`429`: retried with exponential backoff (3 attempts). If it still fails, the asset is recorded as failed and the remaining assets are processed.
 - Assets added or replaced while the action runs are picked up by a final re-list; a hash is never written for a version that differs from the final listing.
 
-The existing checksum file of the release is downloaded first and merged with the new results, so a partial or intermediate upload never drops entries of assets that are not hashed yet:
+The checksum file is uploaded exactly once, at the very end of the run:
 
-- a freshly computed hash replaces the old entry;
-- an old entry is kept for an asset that is still in the release (and matches `patterns`) and was not modified after the existing checksum file;
-- an asset modified after the existing checksum file that could not be re-hashed loses its entry (the old hash would be wrong);
-- entries of assets no longer in the release (or not matching `patterns`) are dropped.
+- right before the upload the release is listed again;
+- the file contains only hashes computed in this run, and only for assets that are `uploaded` in that final listing with the same version (id and `updated_at`) that was hashed;
+- nothing is carried over from the existing checksum file, which is not even read. An asset that failed, vanished, is not `uploaded` or changed after it was hashed gets no entry;
+- if the run stops before the end (cancelled, crashed, timed out), the checksum file already on the release stays untouched.
 
-Lines follow the release asset order. At the end the merged file is always uploaded first, then the action fails if any asset failed persistently (`fail-on-error`). A summary lists processed, re-hashed after replacement, skipped (gone / not uploaded) and failed assets. The checksum file itself is never hashed.
+Lines follow the release asset order. With `fail-on-error: true` (default), if any asset failed persistently nothing is uploaded: the existing checksum file stays untouched and the action exits with 1 after printing the errors and the summary. Assets that vanished or are not `uploaded` are not failures. With `fail-on-error: false` the file is uploaded without the failed assets and only warnings are emitted. A summary lists processed, re-hashed after replacement, skipped (gone / not uploaded) and failed assets. The checksum file itself is never hashed.
 
 ## Example checksum.txt
 

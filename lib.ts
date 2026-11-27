@@ -51,20 +51,6 @@ export function classifyError(err: unknown): ErrorKind {
   return "retry"; // network errors, aborted streams, ...
 }
 
-export function parseChecksumFile(text: string): Map<string, string> {
-  const entries = new Map<string, string>();
-  for (const line of text.split(/\r?\n/)) {
-    if (line.trim() === "") continue;
-    const tab = line.indexOf("\t");
-    if (tab <= 0) continue;
-    const name = line.slice(0, tab);
-    const hash = line.slice(tab + 1).trim();
-    if (hash === "") continue;
-    entries.set(name, hash);
-  }
-  return entries;
-}
-
 function isNewer(a?: string, b?: string): boolean {
   if (!a || !b) return false;
   const ta = Date.parse(a);
@@ -73,44 +59,50 @@ function isNewer(a?: string, b?: string): boolean {
   return ta > tb;
 }
 
-export interface MergeInput {
-  /** Current release assets that are in scope (patterns applied, checksum file excluded), in release order. */
-  assets: Asset[];
-  /** Entries of the checksum file that existed on the release at the start of the run. */
-  existing: Map<string, string>;
-  /** Hashes computed in this run. */
-  fresh: Map<string, string>;
-  /** updated_at of the existing checksum asset; old entries of newer assets are not trusted. */
-  existingUpdatedAt?: string;
-  /** If set, old entries whose hash length differs (other algorithm) are dropped. */
-  expectedHashLength?: number;
+/** True when `current` is the same version (id and updated_at) of the asset as `hashed`. */
+export function sameVersion(hashed: Asset, current: Asset): boolean {
+  if (hashed.id !== undefined && current.id !== undefined && hashed.id !== current.id) return false;
+  if (hashed.updatedAt !== undefined && current.updatedAt !== undefined) {
+    const th = Date.parse(hashed.updatedAt);
+    const tc = Date.parse(current.updatedAt);
+    if (Number.isNaN(th) || Number.isNaN(tc)) return hashed.updatedAt === current.updatedAt;
+    return th === tc;
+  }
+  return true;
+}
+
+export interface HashedAsset {
+  /** The asset version that was hashed. */
+  asset: Asset;
+  hash: string;
 }
 
 /**
- * Merge rules, per asset of the current list (release order):
- *  - fresh hash computed in this run -> use it (replaces the old entry)
- *  - else old entry, if the asset was not modified after the existing checksum file -> keep it
- *  - else (modified after, or never listed) -> no entry
- * Entries for assets that are no longer in scope are dropped.
+ * Lines of the checksum file, in release order of the final listing. An asset gets an entry only if
+ * a hash was computed in this run, it is `uploaded` in the final listing, and the listed version
+ * (id + updated_at) is the hashed one. Nothing is ever carried over from an older checksum file.
  */
-export function mergeChecksums(input: MergeInput): string[] {
+export function buildChecksumLines(finalAssets: Asset[], hashed: Map<string, HashedAsset>): string[] {
   const lines: string[] = [];
   const seen = new Set<string>();
-  for (const asset of input.assets) {
+  for (const asset of finalAssets) {
     if (seen.has(asset.name)) continue;
     seen.add(asset.name);
-    const fresh = input.fresh.get(asset.name);
-    if (fresh !== undefined) {
-      lines.push(`${asset.name}\t${fresh}`);
-      continue;
-    }
-    const old = input.existing.get(asset.name);
-    if (old === undefined) continue;
-    if (input.expectedHashLength && old.length !== input.expectedHashLength) continue;
-    if (isNewer(asset.updatedAt, input.existingUpdatedAt)) continue;
-    lines.push(`${asset.name}\t${old}`);
+    if (asset.state !== undefined && asset.state !== "uploaded") continue;
+    const h = hashed.get(asset.name);
+    if (!h || !sameVersion(h.asset, asset)) continue;
+    lines.push(`${asset.name}\t${h.hash}`);
   }
   return lines;
+}
+
+/**
+ * Upload only when it is safe: with fail-on-error any failed asset blocks the upload (the existing
+ * checksum file stays untouched); otherwise the file is uploaded without the failed assets.
+ * Assets that vanished or are not `uploaded` are not failures.
+ */
+export function shouldUpload(failedCount: number, failOnError: boolean): boolean {
+  return !(failOnError && failedCount > 0);
 }
 
 export function serializeChecksums(lines: string[]): string {
@@ -140,8 +132,7 @@ export function findStale(hashed: Map<string, Asset>, current: Asset[]): Asset[]
   for (const asset of current) {
     const h = hashed.get(asset.name);
     if (!h) continue;
-    const idChanged = h.id !== undefined && asset.id !== undefined && h.id !== asset.id;
-    if (idChanged || isNewer(asset.updatedAt, h.updatedAt)) stale.push(asset);
+    if (!sameVersion(h, asset)) stale.push(asset);
   }
   return stale;
 }

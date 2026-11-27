@@ -4,12 +4,13 @@ import {
   HttpError,
   classifyError,
   findStale,
-  mergeChecksums,
+  buildChecksumLines,
   normalizeAsset,
-  parseChecksumFile,
   processAsset,
   resolveReplacement,
   serializeChecksums,
+  sameVersion,
+  shouldUpload,
   withRetry,
 } from "./lib";
 
@@ -22,19 +23,6 @@ const A = (name: string, id = "1", updatedAt = "2026-01-01T00:00:00Z", state = "
 });
 const noSleep = async () => {};
 
-describe("parseChecksumFile", () => {
-  test("parses tab separated lines, skips blanks and malformed lines, keeps order", () => {
-    const m = parseChecksumFile("b\t22\n\na\t11\r\nbroken line\n\t99\nc\t\n");
-    expect([...m]).toEqual([
-      ["b", "22"],
-      ["a", "11"],
-    ]);
-  });
-  test("empty text", () => {
-    expect(parseChecksumFile("").size).toBe(0);
-  });
-});
-
 describe("normalizeAsset", () => {
   test("maps REST snake_case and numeric ids", () => {
     const a = normalizeAsset({ id: 5, name: "x", size: 1, updated_at: "t", state: "uploaded" });
@@ -46,56 +34,65 @@ describe("normalizeAsset", () => {
   });
 });
 
-describe("mergeChecksums", () => {
-  const existing = new Map([
-    ["a", "old-a"],
-    ["b", "old-b"],
-    ["gone", "old-gone"],
-  ]);
-  const base = "2026-02-01T00:00:00Z";
+describe("buildChecksumLines", () => {
+  const H = (a: Asset, hash: string) => ({ asset: a, hash });
 
-  test("fresh replaces old, old kept for untouched assets, removed assets dropped, release order", () => {
-    const assets = [A("c"), A("b"), A("a")];
-    const lines = mergeChecksums({
-      assets,
-      existing,
-      fresh: new Map([["a", "new-a"], ["c", "new-c"]]),
-      existingUpdatedAt: base,
-    });
-    expect(lines).toEqual(["c\tnew-c", "b\told-b", "a\tnew-a"]);
+  test("only hashes of this run, in the order of the final listing", () => {
+    const a = A("a"), b = A("b"), c = A("c");
+    const hashed = new Map([["a", H(a, "ha")], ["c", H(c, "hc")]]);
+    expect(buildChecksumLines([c, b, a], hashed)).toEqual(["c\thc", "a\tha"]);
   });
 
-  test("asset newer than the checksum file and not re-hashed loses its old entry", () => {
-    const assets = [A("a", "1", "2026-03-01T00:00:00Z"), A("b")];
-    const lines = mergeChecksums({ assets, existing, fresh: new Map(), existingUpdatedAt: base });
-    expect(lines).toEqual(["b\told-b"]);
+  test("asset without a hash from this run gets no entry (nothing is carried over)", () => {
+    expect(buildChecksumLines([A("a"), A("b")], new Map([["a", H(A("a"), "ha")]]))).toEqual(["a\tha"]);
   });
 
-  test("newer asset that was re-hashed gets the fresh entry", () => {
-    const assets = [A("a", "2", "2026-03-01T00:00:00Z")];
-    const lines = mergeChecksums({
-      assets,
-      existing,
-      fresh: new Map([["a", "new"]]),
-      existingUpdatedAt: base,
-    });
-    expect(lines).toEqual(["a\tnew"]);
+  test("asset replaced after hashing (new id or newer updated_at) gets no entry", () => {
+    const hashed = new Map([["a", H(A("a"), "ha")], ["b", H(A("b"), "hb")], ["c", H(A("c"), "hc")]]);
+    const final = [A("a", "2"), A("b", "1", "2026-03-01T00:00:00Z"), A("c")];
+    expect(buildChecksumLines(final, hashed)).toEqual(["c\thc"]);
   });
 
-  test("entries with a different hash length (other algorithm) are not reused", () => {
-    const lines = mergeChecksums({
-      assets: [A("a"), A("b")],
-      existing: new Map([["a", "abcd"], ["b", "ab"]]),
-      fresh: new Map(),
-      expectedHashLength: 4,
-    });
-    expect(lines).toEqual(["a\tabcd"]);
+  test("asset replaced mid-run and hashed again gets the new hash", () => {
+    const v2 = A("a", "2", "2026-03-01T00:00:00Z");
+    expect(buildChecksumLines([v2], new Map([["a", H(v2, "new")]]))).toEqual(["a\tnew"]);
+  });
+
+  test("failed or vanished assets (no hash) and assets not uploaded get no entry", () => {
+    const hashed = new Map([["a", H(A("a"), "ha")], ["gone", H(A("gone"), "hg")], ["open", H(A("open"), "ho")]]);
+    const final = [A("a"), A("failed"), A("open", "1", undefined, "open")];
+    expect(buildChecksumLines(final, hashed)).toEqual(["a\tha"]);
   });
 
   test("duplicates are written once; empty result serializes to empty text", () => {
-    expect(mergeChecksums({ assets: [A("a"), A("a")], existing, fresh: new Map(), existingUpdatedAt: base })).toEqual(["a\told-a"]);
+    expect(buildChecksumLines([A("a"), A("a")], new Map([["a", H(A("a"), "ha")]]))).toEqual(["a\tha"]);
     expect(serializeChecksums([])).toBe("");
     expect(serializeChecksums(["a\t1", "b\t2"])).toBe("a\t1\nb\t2\n");
+  });
+});
+
+describe("shouldUpload", () => {
+  test("fail-on-error and a failure: no upload", () => expect(shouldUpload(1, true)).toBe(false));
+  test("all ok: upload", () => expect(shouldUpload(0, true)).toBe(true));
+  test("vanished asset is no failure: upload without it", () => {
+    const final = [A("a")]; // "gone" was hashed earlier or skipped, not in the final listing
+    const lines = buildChecksumLines(final, new Map([["a", { asset: A("a"), hash: "ha" }]]));
+    expect(shouldUpload(0, true)).toBe(true);
+    expect(lines).toEqual(["a\tha"]);
+  });
+  test("fail-on-error false and a failure: upload without the failed asset", () => {
+    const lines = buildChecksumLines([A("a"), A("bad")], new Map([["a", { asset: A("a"), hash: "ha" }]]));
+    expect(shouldUpload(1, false)).toBe(true);
+    expect(lines).toEqual(["a\tha"]);
+  });
+});
+
+describe("sameVersion", () => {
+  test("compares id and updated_at instants", () => {
+    expect(sameVersion(A("a"), A("a"))).toBe(true);
+    expect(sameVersion(A("a", "1", "2026-01-01T00:00:00Z"), A("a", "1", "2026-01-01T00:00:00.000Z"))).toBe(true);
+    expect(sameVersion(A("a"), A("a", "2"))).toBe(false);
+    expect(sameVersion(A("a"), A("a", "1", "2025-12-01T00:00:00Z"))).toBe(false);
   });
 });
 
