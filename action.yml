@@ -38,7 +38,7 @@ inputs:
     required: false
     default: 'false'
   fail-on-error:
-    description: "Fail the action when an asset could not be hashed after retries. With 'true' nothing is uploaded in that case (the existing checksum file stays untouched) and the action exits 1. With 'false' the checksum file is uploaded without the failed assets and only warnings are emitted."
+    description: "Fail the action when an uploaded asset of the final listing has no hash of its current version from this run (it failed, changed or was added too late), or the release cannot be listed. With 'true' nothing is uploaded in that case (the existing checksum file stays untouched) and the action exits 1. With 'false' the checksum file is uploaded without the failed assets and only warnings are emitted."
     required: false
     default: 'true'
 

@@ -3,14 +3,13 @@ import {
   type Asset,
   HttpError,
   classifyError,
-  findStale,
-  buildChecksumLines,
+  decideFinal,
+  findUnhashed,
   normalizeAsset,
   processAsset,
   resolveReplacement,
   serializeChecksums,
   sameVersion,
-  shouldUpload,
   withRetry,
 } from "./lib";
 
@@ -34,60 +33,103 @@ describe("normalizeAsset", () => {
   });
 });
 
-describe("buildChecksumLines", () => {
+describe("decideFinal", () => {
   const H = (a: Asset, hash: string) => ({ asset: a, hash });
+  const run = (
+    listing: Asset[] | null,
+    hashed: [string, { asset: Asset; hash: string }][],
+    errors: [string, string][] = [],
+    failOnError = true,
+    allowDelete = true
+  ) => decideFinal({ listing, hashed: new Map(hashed), errors: new Map(errors), failOnError, allowDelete });
 
-  test("only hashes of this run, in the order of the final listing", () => {
-    const a = A("a"), b = A("b"), c = A("c");
-    const hashed = new Map([["a", H(a, "ha")], ["c", H(c, "hc")]]);
-    expect(buildChecksumLines([c, b, a], hashed)).toEqual(["c\thc", "a\tha"]);
+  test("all uploaded assets hashed: upload, in the order of the final listing", () => {
+    const a = A("a"), b = A("b");
+    const d = run([b, a], [["a", H(a, "ha")], ["b", H(b, "hb")]]);
+    expect(d.action).toBe("upload");
+    expect(d.lines).toEqual(["b\thb", "a\tha"]);
+    expect(d.failures.size).toBe(0);
   });
 
-  test("asset without a hash from this run gets no entry (nothing is carried over)", () => {
-    expect(buildChecksumLines([A("a"), A("b")], new Map([["a", H(A("a"), "ha")]]))).toEqual(["a\tha"]);
+  test("an uploaded asset without a hash from this run is a failure (nothing is carried over)", () => {
+    const d = run([A("a"), A("late")], [["a", H(A("a"), "ha")]]);
+    expect(d.action).toBe("keep");
+    expect([...d.failures.keys()]).toEqual(["late"]);
+    expect(d.failures.get("late")).toContain("not hashed in this run");
   });
 
-  test("asset replaced after hashing (new id or newer updated_at) gets no entry", () => {
-    const hashed = new Map([["a", H(A("a"), "ha")], ["b", H(A("b"), "hb")], ["c", H(A("c"), "hc")]]);
-    const final = [A("a", "2"), A("b", "1", "2026-03-01T00:00:00Z"), A("c")];
-    expect(buildChecksumLines(final, hashed)).toEqual(["c\thc"]);
+  test("an asset replaced after hashing (new id or newer updated_at) is a failure", () => {
+    const d = run(
+      [A("a", "2"), A("b", "1", "2026-03-01T00:00:00Z"), A("c")],
+      [["a", H(A("a"), "ha")], ["b", H(A("b"), "hb")], ["c", H(A("c"), "hc")]]
+    );
+    expect(d.action).toBe("keep");
+    expect([...d.failures.keys()]).toEqual(["a", "b"]);
+    expect(d.failures.get("a")).toBe("changed after it was hashed");
+    expect(d.lines).toEqual(["c\thc"]);
   });
 
-  test("asset replaced mid-run and hashed again gets the new hash", () => {
+  test("an asset replaced mid-run and hashed again gets the new hash", () => {
     const v2 = A("a", "2", "2026-03-01T00:00:00Z");
-    expect(buildChecksumLines([v2], new Map([["a", H(v2, "new")]]))).toEqual(["a\tnew"]);
+    const d = run([v2], [["a", H(v2, "new")]]);
+    expect(d.action).toBe("upload");
+    expect(d.lines).toEqual(["a\tnew"]);
   });
 
-  test("failed or vanished assets (no hash) and assets not uploaded get no entry", () => {
-    const hashed = new Map([["a", H(A("a"), "ha")], ["gone", H(A("gone"), "hg")], ["open", H(A("open"), "ho")]]);
-    const final = [A("a"), A("failed"), A("open", "1", undefined, "open")];
-    expect(buildChecksumLines(final, hashed)).toEqual(["a\tha"]);
+  test("the error of this run is reported for a listed asset", () => {
+    const d = run([A("a"), A("bad")], [["a", H(A("a"), "ha")]], [["bad", "HTTP 500"]]);
+    expect(d.failures.get("bad")).toBe("HTTP 500");
+  });
+
+  test("errors of assets that are no longer listed are dropped", () => {
+    const d = run([A("a")], [["a", H(A("a"), "ha")]], [["deleted", "HTTP 404"]]);
+    expect(d.action).toBe("upload");
+    expect(d.failures.size).toBe(0);
+  });
+
+  test("assets not uploaded yet are skipped, not failures", () => {
+    const d = run([A("a"), A("open", "1", undefined, "starter")], [["a", H(A("a"), "ha")]]);
+    expect(d.action).toBe("upload");
+    expect(d.notUploaded).toEqual(["open"]);
+    expect(d.lines).toEqual(["a\tha"]);
+  });
+
+  test("fail-on-error false: upload without the failed assets", () => {
+    const d = run([A("a"), A("bad")], [["a", H(A("a"), "ha")]], [["bad", "HTTP 500"]], false);
+    expect(d.action).toBe("upload");
+    expect(d.lines).toEqual(["a\tha"]);
+    expect([...d.failures.keys()]).toEqual(["bad"]);
+  });
+
+  test("fail-on-error false and nothing hashed: keep, never replace or delete the old file", () => {
+    expect(run([A("bad")], [], [["bad", "HTTP 500"]], false).action).toBe("keep");
+  });
+
+  test("no final listing: keep in either mode, errors are reported", () => {
+    const d = run(null, [["a", H(A("a"), "ha")]], [["bad", "x"]]);
+    expect(d.action).toBe("keep");
+    expect(d.lines).toEqual([]);
+    expect([...d.failures.keys()]).toEqual(["bad"]);
+    expect(run(null, [], [], false).action).toBe("keep");
+  });
+
+  test("no in-scope asset left: delete the old file", () => {
+    expect(run([], []).action).toBe("delete");
+    expect(run([], [], [], false).action).toBe("delete");
+  });
+
+  test("no in-scope asset left but patterns are used: keep", () => {
+    expect(run([], [], [], true, false).action).toBe("keep");
+  });
+
+  test("only assets still being uploaded: keep", () => {
+    expect(run([A("open", "1", undefined, "starter")], []).action).toBe("keep");
   });
 
   test("duplicates are written once; empty result serializes to empty text", () => {
-    expect(buildChecksumLines([A("a"), A("a")], new Map([["a", H(A("a"), "ha")]]))).toEqual(["a\tha"]);
+    expect(run([A("a"), A("a")], [["a", H(A("a"), "ha")]]).lines).toEqual(["a\tha"]);
     expect(serializeChecksums([])).toBe("");
     expect(serializeChecksums(["a\t1", "b\t2"])).toBe("a\t1\nb\t2\n");
-  });
-});
-
-describe("shouldUpload", () => {
-  test("fail-on-error and a failure: no upload", () => expect(shouldUpload(1, true, true)).toBe(false));
-  test("all ok: upload", () => expect(shouldUpload(0, true, true)).toBe(true));
-  test("vanished asset is no failure: upload without it", () => {
-    const final = [A("a")]; // "gone" was hashed earlier or skipped, not in the final listing
-    const lines = buildChecksumLines(final, new Map([["a", { asset: A("a"), hash: "ha" }]]));
-    expect(shouldUpload(0, true, true)).toBe(true);
-    expect(lines).toEqual(["a\tha"]);
-  });
-  test("fail-on-error false and a failure: upload without the failed asset", () => {
-    const lines = buildChecksumLines([A("a"), A("bad")], new Map([["a", { asset: A("a"), hash: "ha" }]]));
-    expect(shouldUpload(1, false, true)).toBe(true);
-    expect(lines).toEqual(["a\tha"]);
-  });
-  test("no final listing: no upload in either mode", () => {
-    expect(shouldUpload(0, true, false)).toBe(false);
-    expect(shouldUpload(0, false, false)).toBe(false);
   });
 });
 
@@ -159,11 +201,12 @@ describe("resolveReplacement", () => {
     expect(resolveReplacement(old, [A("x", "2", undefined, "open")]).kind).toBe("gone"));
 });
 
-describe("findStale", () => {
-  test("detects changed id or newer updated_at only for hashed assets", () => {
-    const hashed = new Map([["a", A("a")], ["b", A("b")], ["c", A("c")]]);
-    const current = [A("a", "9"), A("b"), A("c", "1", "2027-01-01T00:00:00Z"), A("d")];
-    expect(findStale(hashed, current).map((a) => a.name)).toEqual(["a", "c"]);
+describe("findUnhashed", () => {
+  test("uploaded assets without a hash of their listed version; not-uploaded ones are ignored", () => {
+    const H = (a: Asset) => ({ asset: a, hash: "h" });
+    const hashed = new Map([["a", H(A("a"))], ["b", H(A("b"))], ["c", H(A("c"))]]);
+    const listing = [A("a", "9"), A("b"), A("c", "1", "2027-01-01T00:00:00Z"), A("d"), A("e", "1", undefined, "open")];
+    expect(findUnhashed(listing, hashed).map((a) => a.name)).toEqual(["a", "c", "d"]);
   });
 });
 

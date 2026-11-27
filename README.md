@@ -12,7 +12,7 @@ Include in your workflow file:
 
 ```yml
 # Prefer a full commit SHA when the job token can write releases.
-uses: XDcobra/checksum@<commit-sha> # v1.0.1
+uses: XDcobra/checksum@<commit-sha> # v1.1.2
 with:
   patterns: | # Optional
     *.zip
@@ -22,7 +22,7 @@ with:
 
 Floating tags such as `@v1` may move after review. For workflows that upload release assets, pin a reviewed commit SHA (and keep transitive pins inside this action).
 
-You must enable write permission in github.com/user/repo/settings/actions -> Workflow permissions -> Read and write permissions.
+The job needs write access to the release. Grant it on the job with `permissions: contents: write` (see the full example) rather than switching the whole repository to read and write workflow permissions.
 
 ## Inputs
 
@@ -35,7 +35,7 @@ You must enable write permission in github.com/user/repo/settings/actions -> Wor
 | `tag`          | The tag of the release to generate checksums for.                                                                               | No           | `''`             |
 | `file-name`    | The name of the checksum file to generate.                                                                                      | No           | `checksum.txt`   |
 | `dry-run`      | Create checksum without upload. Will be available in the console output of the action.                                          | No           | `false`          |
-| `fail-on-error` | Exit non-zero when an asset could not be hashed after retries. With `true` a failure prevents the upload (the existing checksum file stays untouched). With `false` the file is uploaded without the failed assets and only `::warning::` lines are emitted. | No | `true` |
+| `fail-on-error` | Exit non-zero when an uploaded asset of the final listing has no hash of its current version from this run, or the release cannot be listed. With `true` such a failure prevents the upload (the existing checksum file stays untouched). With `false` the file is uploaded without the failed assets and only `::warning::` lines are emitted. | No | `true` |
 | `bun-version`  | The version of Bun to use (pinned concrete version recommended).                                                                | No           | `1.4.4`          |
 
 ## Behaviour with changing release assets
@@ -45,16 +45,21 @@ Release assets may be deleted or re-uploaded while the action runs. Errors are h
 - Only assets in state `uploaded` are processed; others are logged as skipped.
 - `404` while downloading: the release is listed again. If an asset with that name exists with a different id or a newer `updated_at`, the new version is hashed. If it no longer exists, it is skipped with a warning.
 - Network errors and `5xx`/`429`: retried with exponential backoff (3 attempts). If it still fails, the asset is recorded as failed and the remaining assets are processed.
-- Assets added or replaced while the action runs are picked up by a final re-list; a hash is never written for a version that differs from the final listing.
+- Assets added or replaced while the action runs are picked up by listing the release again after the first pass. The action keeps listing and hashing (up to 10 catch-up rounds) until a listing has nothing left to hash. That listing is the final one.
 
-The checksum file is uploaded exactly once, at the very end of the run:
+The checksum file is written from the final listing alone and uploaded exactly once, at the very end of the run:
 
-- right before the upload the release is listed again; if that listing fails, nothing is uploaded in either mode (with `fail-on-error: true` the action exits with 1);
-- the file contains only hashes computed in this run, and only for assets that are `uploaded` in that final listing with the same version (id and `updated_at`) that was hashed;
-- nothing is carried over from the existing checksum file, which is not even read. An asset that failed, vanished, is not `uploaded` or changed after it was hashed gets no entry;
+- every in-scope asset that is `uploaded` in the final listing must have a hash computed in this run for the listed version (id and `updated_at`); an asset without one is a failure (it failed, changed after it was hashed, or was still being added when the catch-up rounds ran out);
+- nothing is carried over from the existing checksum file, which is not even read;
+- assets that are no longer listed are not failures and get no entry; assets that are listed but not `uploaded` yet are skipped and get no entry;
+- if the release cannot be listed at the end, nothing is uploaded in either mode;
 - if the run stops before the end (cancelled, crashed, timed out), the checksum file already on the release stays untouched.
 
-Lines follow the release asset order. With `fail-on-error: true` (default), if any asset failed persistently nothing is uploaded: the existing checksum file stays untouched and the action exits with 1 after printing the errors and the summary. Assets that vanished or are not `uploaded` are not failures. With `fail-on-error: false` the file is uploaded without the failed assets and only warnings are emitted. A summary lists processed, re-hashed after replacement, skipped (gone / not uploaded) and failed assets. The checksum file itself is never hashed.
+With `fail-on-error: true` (default) any failure keeps the existing checksum file untouched and the action exits with 1 after printing the errors and the summary. A release that is still changing when the catch-up rounds run out therefore fails on purpose; the next run picks it up. With `fail-on-error: false` the file is uploaded without the failed assets and only warnings are emitted; if no asset could be hashed at all, nothing is uploaded.
+
+If the final listing has no in-scope assets left and `patterns` is empty, the existing checksum file is deleted from the release, because it only describes assets that no longer exist. With `patterns` set, a run that matches no asset leaves the file untouched.
+
+Lines follow the release asset order. A summary lists processed, re-hashed after replacement, skipped (gone / not uploaded) and failed assets. The checksum file itself is never hashed. An asset uploaded between the final listing and the upload is not in the file and is added by the next run.
 
 ## Example checksum.txt
 
@@ -80,10 +85,12 @@ on:
 jobs:
   test:
     runs-on: macos-latest
+    permissions:
+      contents: write # upload or delete the checksum file on the release
 
     steps:
       - name: Run checksum action
-        uses: XDcobra/checksum@<commit-sha> # v1.0.1
+        uses: XDcobra/checksum@<commit-sha> # v1.1.2
         with:
           patterns: | # Optional
             *.zip
@@ -92,7 +99,6 @@ jobs:
             !b.txt
           algorithm: sha256 # Optional
         env:
-          # You must enable write permission in github.com/user/repo/settings/actions -> Workflow permissions -> Read and write permissions
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
 

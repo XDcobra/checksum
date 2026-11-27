@@ -77,38 +77,87 @@ export interface HashedAsset {
   hash: string;
 }
 
-/**
- * Lines of the checksum file, in release order of the final listing. An asset gets an entry only if
- * a hash was computed in this run, it is `uploaded` in the final listing, and the listed version
- * (id + updated_at) is the hashed one. Nothing is ever carried over from an older checksum file.
- */
-export function buildChecksumLines(finalAssets: Asset[], hashed: Map<string, HashedAsset>): string[] {
-  const lines: string[] = [];
-  const seen = new Set<string>();
-  for (const asset of finalAssets) {
-    if (seen.has(asset.name)) continue;
-    seen.add(asset.name);
-    if (asset.state !== undefined && asset.state !== "uploaded") continue;
+export function isUploaded(asset: Asset): boolean {
+  return asset.state === undefined || asset.state === "uploaded";
+}
+
+/** Uploaded assets of `listing` without a hash of their listed version (id + updated_at) from this run. */
+export function findUnhashed(listing: Asset[], hashed: Map<string, HashedAsset>): Asset[] {
+  return listing.filter((asset) => {
+    if (!isUploaded(asset)) return false;
     const h = hashed.get(asset.name);
-    if (!h || !sameVersion(h.asset, asset)) continue;
-    lines.push(`${asset.name}\t${h.hash}`);
-  }
-  return lines;
+    return !h || !sameVersion(h.asset, asset);
+  });
 }
 
 /**
- * Upload only when it is safe: with fail-on-error any failed asset blocks the upload (the existing
- * checksum file stays untouched); otherwise the file is uploaded without the failed assets.
- * Assets that vanished or are not `uploaded` are not failures. Without a final listing nothing can be
- * verified, so nothing is uploaded in either mode.
+ * What to do with the checksum file on the release:
+ * - `upload`: replace it with `lines`;
+ * - `delete`: the final listing has no in-scope assets left, so the old file describes nothing that exists;
+ * - `keep`: leave the file on the release untouched.
  */
-export function shouldUpload(
-  failedCount: number,
-  failOnError: boolean,
-  finalListingOk: boolean
-): boolean {
-  if (!finalListingOk) return false;
-  return !(failOnError && failedCount > 0);
+export type FinalAction = "upload" | "delete" | "keep";
+
+export interface FinalDecision {
+  /** Lines of the checksum file, in the order of the final listing. */
+  lines: string[];
+  /** Uploaded assets of the final listing without a hash of their listed version from this run. */
+  failures: Map<string, string>;
+  /** In-scope assets of the final listing that are not `uploaded` yet. */
+  notUploaded: string[];
+  action: FinalAction;
+}
+
+/**
+ * Decide the end of the run from the final listing alone (in-scope assets only; `null` when the
+ * release could not be listed). Every uploaded asset in it must have a hash of the listed version
+ * computed in this run, otherwise it is a failure. Errors of assets that are no longer listed are
+ * dropped. Nothing is ever carried over from an older checksum file.
+ *
+ * With `failOnError` any failure keeps the old file. Without it the file is uploaded without the
+ * failed assets, unless no asset could be hashed at all. The file is deleted only when the final
+ * listing succeeded, nothing failed, no in-scope asset is listed any more and `allowDelete` is set
+ * (the caller passes false when patterns are used, so a pattern that matches nothing keeps the file).
+ */
+export function decideFinal(input: {
+  listing: Asset[] | null;
+  hashed: Map<string, HashedAsset>;
+  errors: Map<string, string>;
+  failOnError: boolean;
+  allowDelete: boolean;
+}): FinalDecision {
+  const { listing, hashed, errors, failOnError, allowDelete } = input;
+  if (listing === null) {
+    return { lines: [], failures: new Map(errors), notUploaded: [], action: "keep" };
+  }
+  const lines: string[] = [];
+  const failures = new Map<string, string>();
+  const notUploaded: string[] = [];
+  const seen = new Set<string>();
+  for (const asset of listing) {
+    if (seen.has(asset.name)) continue;
+    seen.add(asset.name);
+    if (!isUploaded(asset)) {
+      notUploaded.push(asset.name);
+      continue;
+    }
+    const h = hashed.get(asset.name);
+    if (h && sameVersion(h.asset, asset)) {
+      lines.push(`${asset.name}\t${h.hash}`);
+      continue;
+    }
+    failures.set(
+      asset.name,
+      errors.get(asset.name) ??
+        (h ? "changed after it was hashed" : "not hashed in this run (added or replaced at the end of the run)")
+    );
+  }
+  let action: FinalAction;
+  if (failures.size > 0 && failOnError) action = "keep";
+  else if (lines.length > 0) action = "upload";
+  else if (failures.size > 0 || notUploaded.length > 0 || !allowDelete) action = "keep";
+  else action = "delete";
+  return { lines, failures, notUploaded, action };
 }
 
 export function serializeChecksums(lines: string[]): string {
@@ -130,17 +179,6 @@ export function resolveReplacement(old: Asset, current: Asset[]): Replacement {
     return { kind: "replaced", asset: found };
   }
   return { kind: "unchanged" };
-}
-
-/** Assets we hashed whose version in `current` differs from the hashed one. */
-export function findStale(hashed: Map<string, Asset>, current: Asset[]): Asset[] {
-  const stale: Asset[] = [];
-  for (const asset of current) {
-    const h = hashed.get(asset.name);
-    if (!h) continue;
-    if (!sameVersion(h, asset)) stale.push(asset);
-  }
-  return stale;
 }
 
 export interface RetryOptions {

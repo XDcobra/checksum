@@ -1,15 +1,15 @@
 import { $, Glob, type SupportedCryptoAlgorithms } from "bun";
-import { readFile, stat, writeFile } from "fs/promises";
+import { readFile, writeFile } from "fs/promises";
 import {
   type Asset,
   HttpError,
-  buildChecksumLines,
+  decideFinal,
+  findUnhashed,
   type HashedAsset,
-  findStale,
+  isUploaded,
   normalizeAsset,
   processAsset,
   serializeChecksums,
-  shouldUpload,
   withRetry,
 } from "./lib";
 
@@ -177,13 +177,28 @@ async function uploadChecksumFile(
     );
     return;
   }
-  const fileInfo = await stat(checkSumPath);
-  if (fileInfo.size === 0) {
-    console.warn("Checksum is empty. Skipping upload.");
-  } else {
-    console.log("Uploading checksum file.");
-    await $`gh release upload -R ${repo} ${tag} ${checkSumPath} --clobber`;
+  console.log("Uploading checksum file.");
+  // gh deletes the old asset before uploading; a retry after a failed upload just uploads again.
+  await withRetry(
+    () => $`gh release upload -R ${repo} ${tag} ${checkSumPath} --clobber`,
+    retryOptions
+  );
+}
+
+async function deleteChecksumFile(
+  checkSumPath: string,
+  repo: string,
+  tag: string
+): Promise<void> {
+  if (isDryRun) {
+    console.info(`Dry run. Skipping deletion of ${checkSumPath} from ${repo}@${tag}`);
+    return;
   }
+  console.warn(`Deleting ${checkSumPath}: the release has no assets left that it could describe.`);
+  await withRetry(
+    () => $`gh release delete-asset ${tag} ${checkSumPath} -R ${repo} -y`,
+    retryOptions
+  );
 }
 
 console.log("Starting checksum action...");
@@ -255,13 +270,13 @@ const inScope = (list: Asset[]) =>
 let assets = await withRetry(listAssets, retryOptions);
 
 // Only hashes computed in this run; an existing checksum file on the release is never read or merged.
-const hashedResults = new Map<string, HashedAsset>(); // name -> hashed version + hash
-const hashedVersion = new Map<string, Asset>(); // name -> asset version that was hashed
+const hashed = new Map<string, HashedAsset>(); // name -> hashed version + hash
 const rehashed = new Set<string>();
 const skippedGone = new Set<string>();
-const failed = new Map<string, string>(); // name -> error message
+const errors = new Map<string, string>(); // name -> error message of this run
 
 async function processOne(asset: Asset): Promise<void> {
+  const wasHashed = hashed.has(asset.name);
   const outcome = await processAsset(asset, {
     hash: hashAssetFromRelease,
     listAssets: async () => {
@@ -272,106 +287,101 @@ async function processOne(asset: Asset): Promise<void> {
     log: (msg) => console.warn(msg),
   });
   if (outcome.kind === "hashed") {
-    hashedResults.set(asset.name, { asset: outcome.asset, hash: outcome.hash });
-    hashedVersion.set(asset.name, outcome.asset);
-    failed.delete(asset.name);
+    hashed.set(asset.name, { asset: outcome.asset, hash: outcome.hash });
+    errors.delete(asset.name);
     skippedGone.delete(asset.name);
-    if (outcome.replaced) rehashed.add(asset.name);
+    if (outcome.replaced || wasHashed) rehashed.add(asset.name);
   } else if (outcome.kind === "gone") {
-    console.warn(`::warning::${asset.name} no longer exists in the release, skipped`);
-    hashedResults.delete(asset.name);
-    hashedVersion.delete(asset.name);
+    console.warn(
+      `::warning::${asset.name} is not in the release any more (deleted, or being replaced), skipped`
+    );
+    hashed.delete(asset.name);
     skippedGone.add(asset.name);
   } else {
     const msg =
       outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
     console.error(`Failed to hash ${asset.name}: ${msg}`);
-    hashedResults.delete(asset.name);
-    failed.set(asset.name, msg);
+    hashed.delete(asset.name);
+    errors.set(asset.name, msg);
   }
 }
 
-const notUploaded = new Set<string>();
 for (const asset of assets) {
   if (asset.name == checkSumPath) continue;
   if (patterns.length && !shouldIncludeAsset(asset.name, patterns)) {
     console.log(`Skip ${asset.name}`);
     continue;
   }
-  if (asset.state !== undefined && asset.state !== "uploaded") {
+  if (!isUploaded(asset)) {
     console.warn(`Skip ${asset.name}: state is "${asset.state}", not "uploaded"`);
-    notUploaded.add(asset.name);
     continue;
   }
 
   await processOne(asset);
 }
 
-// Assets may have been replaced or added while we were hashing: re-list and catch up.
-for (let round = 0; round < 3; round++) {
+// Assets may have been replaced or added while we were hashing: list again and catch up until a
+// listing has nothing left to hash. That listing is the final one the checksum file is built from.
+const MAX_CATCH_UP_ROUNDS = 10;
+let finalListing: Asset[] | null = null;
+for (let round = 0; ; round++) {
+  let listing: Asset[];
   try {
-    assets = await withRetry(listAssets, retryOptions);
+    listing = await withRetry(listAssets, retryOptions);
   } catch (err) {
-    console.warn(`Could not re-list the release: ${err instanceof Error ? err.message : err}`);
+    console.error(
+      `Could not list the release (${err instanceof Error ? err.message : err}); the hashes cannot be checked against the current assets`
+    );
     break;
   }
-  const todo = inScope(assets).filter(
-    (a) =>
-      (a.state === undefined || a.state === "uploaded") &&
-      !failed.has(a.name) &&
-      (!hashedVersion.has(a.name) || findStale(hashedVersion, [a]).length > 0)
-  );
-  if (todo.length === 0) break;
+  assets = listing;
+  const todo = findUnhashed(inScope(listing), hashed).filter((a) => !errors.has(a.name));
+  if (todo.length === 0 || round === MAX_CATCH_UP_ROUNDS) {
+    finalListing = listing;
+    break;
+  }
   for (const asset of todo) {
     console.log(`Catching up on ${asset.name} (new or changed during the run)`);
-    const wasHashed = hashedVersion.has(asset.name);
     await processOne(asset);
-    if (wasHashed && hashedResults.has(asset.name)) rehashed.add(asset.name);
   }
 }
 
-// Final listing right before the single upload: only hashes of the version that is listed now are written.
-let finalAssets = assets;
-let finalListingOk = true;
-try {
-  finalAssets = await withRetry(listAssets, retryOptions);
-  assets = finalAssets;
-} catch (err) {
-  finalListingOk = false;
-  console.error(
-    `Could not list the release before the upload (${err instanceof Error ? err.message : err}); the hashes cannot be checked against the current assets`
-  );
-}
-for (const asset of findStale(hashedVersion, finalAssets)) {
-  console.error(`${asset.name} changed after it was hashed; no entry is written`);
-  hashedResults.delete(asset.name);
-  failed.set(asset.name, "changed after it was hashed");
-}
-const lines = buildChecksumLines(inScope(finalAssets), hashedResults);
-await writeFile(checkSumPath, serializeChecksums(lines));
-const uploadAllowed = shouldUpload(failed.size, failOnError, finalListingOk);
-if (uploadAllowed) {
+const decision = decideFinal({
+  listing: finalListing && inScope(finalListing),
+  hashed,
+  errors,
+  failOnError,
+  allowDelete: patterns.length === 0,
+});
+await writeFile(checkSumPath, serializeChecksums(decision.lines));
+const keepReason =
+  finalListing === null
+    ? "the release could not be listed"
+    : decision.failures.size > 0
+      ? `${decision.failures.size} asset(s) have no hash of their current version`
+      : decision.notUploaded.length > 0
+        ? `${decision.notUploaded.length} asset(s) are still being uploaded and nothing else is left to hash`
+        : "the patterns match no asset of the release";
+if (decision.action === "upload") {
   await uploadChecksumFile(checkSumPath, repo, tag);
-} else if (!finalListingOk) {
-  console.error(
-    `Not uploading without a final listing: the existing ${checkSumPath} on the release stays untouched`
-  );
+} else if (decision.action === "delete") {
+  if (finalListing!.some((a) => a.name === checkSumPath)) {
+    await deleteChecksumFile(checkSumPath, repo, tag);
+  } else {
+    console.log(`No in-scope assets and no ${checkSumPath} on the release: nothing to do`);
+  }
 } else {
   console.error(
-    `${failed.size} asset(s) could not be hashed and fail-on-error is set: not uploading, the existing ${checkSumPath} on the release stays untouched`
+    `Not uploading: ${keepReason}. The existing ${checkSumPath} on the release stays untouched`
   );
 }
 
-const finalScope = inScope(assets);
-const stillNotUploaded = finalScope.filter(
-  (a) => a.state !== undefined && a.state !== "uploaded"
-).length;
 const summary = {
-  processed: lines.length,
+  processed: decision.lines.length,
   rehashedAfterReplacement: rehashed.size,
   skippedGone: skippedGone.size,
-  skippedNotUploaded: stillNotUploaded,
-  failed: failed.size,
+  skippedNotUploaded: decision.notUploaded.length,
+  failed: decision.failures.size,
 };
 
 console.log(
@@ -385,10 +395,10 @@ console.log(
 console.log(`Checksum file content:\n${await readFile(checkSumPath, "utf-8")}`);
 
 const level = failOnError ? "error" : "warning";
-if (!finalListingOk) {
+if (finalListing === null) {
   console.log(`::${level}::Could not list the release before the upload; ${checkSumPath} was not uploaded`);
 }
-for (const [name, msg] of failed) {
+for (const [name, msg] of decision.failures) {
   console.log(`::${level}::Could not checksum ${name}: ${msg}`);
 }
-if (failOnError && (failed.size > 0 || !finalListingOk)) process.exit(1);
+if (failOnError && (decision.failures.size > 0 || finalListing === null)) process.exit(1);
